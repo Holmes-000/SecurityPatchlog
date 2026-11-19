@@ -1,0 +1,17 @@
+{
+  "name": "secpatchlog",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Collects AI-triaged security scan results and lets the team assign and track them.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch src/server.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}
