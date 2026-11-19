@@ -13,6 +13,7 @@ const {
   rateLimit,
 } = require('./auth');
 const { makeIngest } = require('./ingest');
+const { mailEnabled, sendWelcomeEmail } = require('./mailer');
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -182,7 +183,7 @@ function createApi(db, getSecret) {
 
   // Settings the UI needs. publicUrl is the address CI uses to reach this server (PUBLIC_URL),
   // null = the UI falls back to the address in the browser.
-  router.get('/config', (req, res) => res.json({ publicUrl: publicUrl() }));
+  router.get('/config', (req, res) => res.json({ publicUrl: publicUrl(), mailEnabled: mailEnabled() }));
 
   router.post('/auth/password', (req, res) => {
     if (!verifyPassword(String(req.body?.current || ''), req.user.password_hash)) {
@@ -200,9 +201,25 @@ function createApi(db, getSecret) {
     res.json({ users: users.map(publicUser) });
   });
 
-  router.post('/users', requireAdmin, (req, res) => {
+  router.post('/users', requireAdmin, async (req, res) => {
     const user = createUser({ ...req.body, role: req.body?.role || 'member' });
-    res.status(201).json({ user: publicUser(user) });
+    // Email the sign-in details unless the admin unticked it. A mail failure doesn't undo the user.
+    let email = { sent: false, error: null };
+    if (req.body?.sendEmail !== false && mailEnabled()) {
+      try {
+        await sendWelcomeEmail({
+          user,
+          password: req.body.password,
+          loginUrl: `${publicUrl() || `${req.protocol}://${req.get('host')}`}/`,
+          invitedBy: req.user.name,
+        });
+        email.sent = true;
+      } catch (err) {
+        console.error(`[secpatchlog] welcome email to ${user.email} failed:`, err.message);
+        email.error = 'The welcome email could not be sent. Check the SMTP settings and the server log.';
+      }
+    }
+    res.status(201).json({ user: publicUser(user), email });
   });
 
   router.patch('/users/:id', requireAdmin, (req, res) => {

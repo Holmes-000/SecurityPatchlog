@@ -142,6 +142,7 @@ async function loadShared() {
   state.users = users.users;
   state.projects = projects.projects;
   state.publicUrl = config.publicUrl;
+  state.mailEnabled = !!config.mailEnabled;
 }
 
 /* ---------------- Project covers ---------------- */
@@ -1074,8 +1075,12 @@ async function renderUsers() {
       onsubmit: async (e) => {
         e.preventDefault();
         try {
-          await api('POST', '/users', Object.fromEntries(new FormData(e.target)));
-          toast('User created');
+          const body = Object.fromEntries(new FormData(e.target));
+          body.sendEmail = body.sendEmail === 'on';
+          const r = await api('POST', '/users', body);
+          if (r.email?.sent) toast(`User created. Sign-in details emailed to ${r.user.email}`);
+          else if (r.email?.error) toast(`User created, but ${r.email.error.charAt(0).toLowerCase()}${r.email.error.slice(1)}`, true);
+          else toast('User created');
           renderUsers();
         } catch (ex) {
           toast(ex.message, true);
@@ -1091,7 +1096,10 @@ async function renderUsers() {
       h('label', { class: 'field' }, 'Temporary password', h('input', { name: 'password', type: 'text', required: true, minlength: 10, autocomplete: 'off' })),
       h('label', { class: 'field' }, 'Role', h('select', { name: 'role' }, options([['member', 'Member'], ['admin', 'Admin']], 'member'))),
       h('button', { class: 'primary', type: 'submit' }, 'Add')
-    )
+    ),
+    state.mailEnabled
+      ? h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'sendEmail', checked: true }), 'Email the sign-in details to the new user')
+      : null
   );
 
   const rows = state.users.map((u) => {

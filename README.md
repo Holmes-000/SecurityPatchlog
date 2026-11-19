@@ -44,6 +44,15 @@ in `.env` so the admin is created on first start. After that:
 | `SESSION_SECRET` | generated          | If empty, a random one is generated and stored in the DB |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` / `ADMIN_NAME` | — | Only used when there are no users yet |
 | `TRUST_PROXY`    | `0`                | Set `1` behind nginx or a load balancer so rate limiting sees real IPs |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURE` / `SMTP_USER` / `SMTP_PASS` | — / `587` / auto | SMTP server for emailing new users. Mail is off while `SMTP_HOST` is empty. `SMTP_SECURE` defaults to on for port 465 (TLS); port 587 uses STARTTLS |
+| `MAIL_FROM`      | `SMTP_USER`        | Sender, e.g. `SecPatchlog <security@example.com>` |
+
+### Welcome emails
+
+When SMTP is configured, **Users → Add team member** shows an "Email the sign-in details" checkbox (ticked by default).
+The new user gets the sign-in link (`PUBLIC_URL`, else the address the admin is using), their email and the temporary
+password, and is asked to change it under **Account**. If sending fails the user is still created, the admin sees a
+warning, and the error is in the server log (`pm2 logs`).
 
 ## Sending results from the triage script
 
