@@ -366,6 +366,13 @@ function createApi(db, getSecret) {
     const id = idParam(req.params.id);
     if (!db.prepare('SELECT 1 FROM projects WHERE id = ?').get(id)) throw new HttpError(404, 'Project not found.');
     const b = req.body || {};
+    if (b.name !== undefined) {
+      const name = text(b.name, 'Name', { max: 100, required: true });
+      if (db.prepare('SELECT 1 FROM projects WHERE name = ? AND id != ?').get(name, id)) {
+        throw new HttpError(409, 'A project with that name already exists.');
+      }
+      db.prepare('UPDATE projects SET name = ? WHERE id = ?').run(name, id);
+    }
     if (b.description !== undefined) {
       db.prepare('UPDATE projects SET description = ? WHERE id = ?').run(
         text(b.description, 'Description', { max: 500 }),
@@ -383,6 +390,29 @@ function createApi(db, getSecret) {
       db.prepare('UPDATE projects SET scan_interval_days = ? WHERE id = ?').run(days, id);
     }
     res.json({ project: publicProject(db.prepare(`${projectStats} WHERE p.id = ?`).get(id)) });
+  });
+
+  // Deletes the project and everything under it (scans, findings, activity, cover) via ON DELETE CASCADE.
+  // The caller must send the project's exact name as confirmName, so a stray request can't wipe a project.
+  router.delete('/projects/:id', requireAdmin, (req, res) => {
+    const id = idParam(req.params.id);
+    const result = transaction(db, () => {
+      const p = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(id);
+      if (!p) throw new HttpError(404, 'Project not found.');
+      if (String(req.body?.confirmName ?? '') !== p.name) {
+        throw new HttpError(400, 'Type the project name exactly to confirm deletion.');
+      }
+      const counts = {
+        findings: db.prepare('SELECT COUNT(*) AS n FROM findings WHERE project_id = ?').get(id).n,
+        scans: db.prepare('SELECT COUNT(*) AS n FROM scans WHERE project_id = ?').get(id).n,
+      };
+      db.prepare('DELETE FROM projects WHERE id = ?').run(id);
+      return { name: p.name, ...counts };
+    });
+    console.log(
+      `[secpatchlog] project "${result.name}" (#${id}) deleted by ${req.user.email}: ${result.findings} findings, ${result.scans} scans`
+    );
+    res.json({ deleted: result });
   });
 
   router.post('/projects/:id/rotate-key', requireAdmin, (req, res) => {

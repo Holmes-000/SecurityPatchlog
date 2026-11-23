@@ -1,0 +1,266 @@
+name: Security Scan
+
+# Runs after your deploy workflow succeeds on the default branch (or manually).
+#
+# TEMPLATE from SecPatchlog (templates/). Search for "CHANGE ME" and set the 4 marked values.
+#
+# Job "gate": asks SecPatchlog (TRIAGE_GATE_URL) whether this project is due for a scan.
+# Job "scan": only if the gate says 1. Runs inside a throwaway node:24 container:
+#   checks out the deployed commit, installs opengrep + Claude Code (or opencode),
+#   runs scripts/triage-opengrep.js (opengrep -> AI triage with the whole repo as
+#   read-only context -> POST to SecPatchlog), and keeps the reports as an artifact.
+#
+# Settings, all in the GitHub environment named under `environment:` below:
+#   Secrets
+#     TRIAGE_REPORT_URL, TRIAGE_REPORT_TOKEN, TRIAGE_GATE_URL   SecPatchlog
+#     CLAUDE_CODE_OAUTH_TOKEN        Claude subscription token (`claude setup-token`)
+#     ANTHROPIC_API_KEY              Anthropic API key (pay per use)
+#     ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL   Anthropic-compatible gateway, e.g. OpenRouter
+#     OPENROUTER_API_KEY / OPENAI_API_KEY / GOOGLE_GENERATIVE_AI_API_KEY   for TRIAGE_ENGINE=opencode
+#     Only the ones for the provider you use need to exist.
+#   Variables (all optional)
+#     TRIAGE_ENGINE        claude (default) | opencode
+#     TRIAGE_CLAUDE_AUTH   auto (default: OAuth token, else API key, else gateway) | oauth | apikey | gateway
+#     TRIAGE_MODEL         model override, e.g. opus, or openrouter/google/gemini-2.5-pro for opencode
+#     CLAUDE_CODE_VERSION / OPENCODE_VERSION / OPENGREP_VERSION   pin a tool version (default: latest)
+#     OPENGREP_RULESETS    comma-separated opengrep-rules folders (default: javascript,typescript,generic)
+
+on:
+  workflow_run:
+    workflows: ["Deploy"]          # CHANGE ME: the exact `name:` of your deploy workflow
+    types: [completed]
+    branches: [main]               # CHANGE ME if your default branch is not main
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Scan even if SecPatchlog says the last scan is recent"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-scan-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  # The commit that was deployed (workflow_run), or the selected ref (manual run)
+  SCAN_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+  SCAN_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+  SCAN_ACTOR: ${{ github.event.workflow_run.actor.login || github.actor }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Ask SecPatchlog first, so nothing is started when a scan isn't due
+  # ---------------------------------------------------------------------------
+  gate:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, Linux, X64, markrunner]   # CHANGE ME: your runner labels (or ubuntu-latest)
+    environment: security-scan     # CHANGE ME: environment holding the secrets/variables
+    timeout-minutes: 5
+    outputs:
+      scan: ${{ steps.gate.outputs.scan }}
+    steps:
+      - name: Check whether a scan is due
+        id: gate
+        shell: bash
+        env:
+          FORCE_SCAN: ${{ github.event.inputs.force || 'false' }}
+        run: |
+          set -euo pipefail
+          export TRIAGE_GATE_URL="${{ secrets.TRIAGE_GATE_URL }}"
+          export TRIAGE_REPORT_TOKEN="${{ secrets.TRIAGE_REPORT_TOKEN }}"
+          echo "====================================="
+          echo "Security scan gate for ${SCAN_BRANCH} @ ${SCAN_SHA}"
+          echo "====================================="
+          scan=1
+          if [ "$FORCE_SCAN" = "true" ]; then
+            echo "Manual run with force: skipping the gate."
+          elif [ -z "$TRIAGE_GATE_URL" ] || [ -z "$TRIAGE_REPORT_TOKEN" ]; then
+            echo "::warning::TRIAGE_GATE_URL or TRIAGE_REPORT_TOKEN not set; scanning without asking SecPatchlog."
+          else
+            body_file="$(mktemp)"
+            code="$(curl -sS --max-time 20 -o "$body_file" -w '%{http_code}' \
+              -H "Authorization: Bearer ${TRIAGE_REPORT_TOKEN}" "$TRIAGE_GATE_URL" || echo 000)"
+            answer="$(tr -d '[:space:]' < "$body_file")"
+            rm -f "$body_file"
+            if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+              echo "::error::SecPatchlog rejected TRIAGE_REPORT_TOKEN (HTTP $code). Check the project key."
+              exit 1
+            elif [ "$code" = "200" ] && { [ "$answer" = "0" ] || [ "$answer" = "1" ]; }; then
+              scan="$answer"
+            else
+              # Fail open: a SecPatchlog outage must not silently stop scanning
+              echo "::warning::SecPatchlog gate unavailable (HTTP $code); scanning anyway."
+            fi
+          fi
+          echo "scan=$scan" >> "$GITHUB_OUTPUT"
+          if [ "$scan" = "0" ]; then
+            echo "Scanned recently according to SecPatchlog; skipping." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Scan is due."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Scan + AI triage inside a throwaway container
+  # ---------------------------------------------------------------------------
+  scan:
+    needs: gate
+    if: needs.gate.outputs.scan == '1'
+    runs-on: [self-hosted, Linux, X64, markrunner]   # CHANGE ME: your runner labels (or ubuntu-latest)
+    environment: security-scan     # CHANGE ME: environment holding the secrets/variables
+    timeout-minutes: 90
+    container:
+      image: node:24-bookworm
+      options: --security-opt no-new-privileges
+
+    steps:
+      # The whole source at the deployed commit, so the AI has full context.
+      # persist-credentials: false = the checkout token is NOT left in .git/config,
+      # so nothing the AI can read gives access to the repo.
+      - name: Checkout deployed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SCAN_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install opengrep and the AI tools
+        shell: bash
+        env:
+          TRIAGE_ENGINE: ${{ vars.TRIAGE_ENGINE || 'claude' }}
+          CLAUDE_CODE_VERSION: ${{ vars.CLAUDE_CODE_VERSION || 'latest' }}
+          OPENCODE_VERSION: ${{ vars.OPENCODE_VERSION || 'latest' }}
+          OPENGREP_VERSION: ${{ vars.OPENGREP_VERSION }}
+        run: |
+          set -euo pipefail
+          echo "====================================="
+          echo "Installing tools"
+          echo "====================================="
+          if [ "$TRIAGE_ENGINE" = "opencode" ]; then
+            npm install -g --no-fund --no-audit "opencode-ai@${OPENCODE_VERSION}"
+          else
+            npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+          fi
+          # opengrep installs to ~/.opengrep/cli/<version>, with ~/.opengrep/cli/latest pointing at it
+          curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/main/install.sh \
+            | bash -s -- ${OPENGREP_VERSION:+-v "$OPENGREP_VERSION"}
+          echo "$HOME/.opengrep/cli/latest" >> "$GITHUB_PATH"
+          rm -rf "$RUNNER_TEMP/opengrep-rules"   # may be left over from an earlier run
+          git clone --depth 1 -q https://github.com/opengrep/opengrep-rules "$RUNNER_TEMP/opengrep-rules"
+          "$HOME/.opengrep/cli/latest/opengrep" --version
+
+      - name: Scan, triage and report to SecPatchlog
+        shell: bash
+        env:
+          TRIAGE_ENGINE: ${{ vars.TRIAGE_ENGINE || 'claude' }}
+          TRIAGE_CLAUDE_AUTH: ${{ vars.TRIAGE_CLAUDE_AUTH || 'auto' }}
+          TRIAGE_MODEL: ${{ vars.TRIAGE_MODEL }}
+          DISABLE_AUTOUPDATER: '1'
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+        run: |
+          set -euo pipefail
+          export TRIAGE_REPORT_URL="${{ secrets.TRIAGE_REPORT_URL }}"
+          export TRIAGE_REPORT_TOKEN="${{ secrets.TRIAGE_REPORT_TOKEN }}"
+          export CLAUDE_CODE_OAUTH_TOKEN="${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}"
+          export ANTHROPIC_API_KEY="${{ secrets.ANTHROPIC_API_KEY }}"
+          export ANTHROPIC_AUTH_TOKEN="${{ secrets.ANTHROPIC_AUTH_TOKEN }}"
+          export ANTHROPIC_BASE_URL="${{ secrets.ANTHROPIC_BASE_URL }}"
+          export OPENROUTER_API_KEY="${{ secrets.OPENROUTER_API_KEY }}"
+          export OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}"
+          export GOOGLE_GENERATIVE_AI_API_KEY="${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}"
+          export OPENGREP_RULES_DIR="$RUNNER_TEMP/opengrep-rules"
+          export OPENGREP_RULESETS="${{ vars.OPENGREP_RULESETS }}"
+          # The triage script reports branch/commit/actor from these; point them at the deployed commit
+          export GITHUB_SHA="$SCAN_SHA" GITHUB_REF_NAME="$SCAN_BRANCH" GITHUB_ACTOR="$SCAN_ACTOR"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          # GitHub passes unset secrets as empty strings; treat empty as "not set"
+          for v in CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
+                   OPENROUTER_API_KEY OPENAI_API_KEY GOOGLE_GENERATIVE_AI_API_KEY TRIAGE_MODEL; do
+            if [ -z "${!v:-}" ]; then unset "$v"; fi
+          done
+
+          # Pick the credential and remove the others, so the AI tool can only use the chosen one
+          case "$TRIAGE_ENGINE" in
+            claude)
+              auth="$TRIAGE_CLAUDE_AUTH"
+              if [ "$auth" = "auto" ]; then
+                if   [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then auth=oauth
+                elif [ -n "${ANTHROPIC_API_KEY:-}" ];       then auth=apikey
+                elif [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ];    then auth=gateway
+                else echo "::error::TRIAGE_ENGINE=claude but none of CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is set."; exit 1
+                fi
+              fi
+              case "$auth" in
+                oauth)
+                  [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || { echo "::error::TRIAGE_CLAUDE_AUTH=oauth but CLAUDE_CODE_OAUTH_TOKEN is not set."; exit 1; }
+                  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ;;
+                apikey)
+                  [ -n "${ANTHROPIC_API_KEY:-}" ] || { echo "::error::TRIAGE_CLAUDE_AUTH=apikey but ANTHROPIC_API_KEY is not set."; exit 1; }
+                  unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ;;
+                gateway)
+                  { [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ] && [ -n "${ANTHROPIC_BASE_URL:-}" ]; } \
+                    || { echo "::error::TRIAGE_CLAUDE_AUTH=gateway needs both ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL."; exit 1; }
+                  unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ;;
+                *) echo "::error::TRIAGE_CLAUDE_AUTH must be auto, oauth, apikey or gateway (got '$auth')."; exit 1 ;;
+              esac
+              unset OPENROUTER_API_KEY OPENAI_API_KEY GOOGLE_GENERATIVE_AI_API_KEY
+              echo "AI engine: claude (auth: $auth)"
+              ;;
+            opencode)
+              if [ -z "${OPENROUTER_API_KEY:-}${OPENAI_API_KEY:-}${GOOGLE_GENERATIVE_AI_API_KEY:-}${ANTHROPIC_API_KEY:-}" ]; then
+                echo "::error::TRIAGE_ENGINE=opencode needs one of OPENROUTER_API_KEY, OPENAI_API_KEY, GOOGLE_GENERATIVE_AI_API_KEY or ANTHROPIC_API_KEY."; exit 1
+              fi
+              unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL
+              echo "AI engine: opencode"
+              ;;
+            *) echo "::error::TRIAGE_ENGINE must be claude or opencode (got '$TRIAGE_ENGINE')."; exit 1 ;;
+          esac
+
+          echo "====================================="
+          echo "Security scan START (${SCAN_BRANCH} @ ${SCAN_SHA})"
+          echo "====================================="
+          args=(scripts/triage-opengrep.js --engine "$TRIAGE_ENGINE" --force)   # the gate job already asked
+          if [ -n "${TRIAGE_MODEL:-}" ]; then args+=(--model "$TRIAGE_MODEL"); fi
+          node "${args[@]}"
+          echo "====================================="
+          echo "Security scan COMPLETE"
+          echo "====================================="
+
+      - name: Add report to run summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f opengrep-triage.md ]; then
+            {
+              echo "## Security triage (${SCAN_BRANCH} @ ${SCAN_SHA:0:8})"
+              echo
+              head -c 60000 opengrep-triage.md
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-${{ github.run_id }}
+          path: |
+            opengrep-triage.md
+            opengrep-triage.json
+            opengrep-results.sarif
+            opengrep.txt
+            opengrep-triage.raw.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # Steps run as root in the container, so the runner user can't delete what they leave
+      # behind on the server (tools, rules, reports). Remove it here, while still root.
+      - name: Clean up
+        if: always()
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/opengrep-rules" "$HOME/.opengrep" "$HOME/.claude" "$HOME/.claude.json" \
+                 "$HOME/.npm" "$HOME/.config/opencode" "$HOME/.local/share/opencode"
+          rm -f opengrep.txt opengrep-results.sarif opengrep-triage.md opengrep-triage.json opengrep-triage.raw.txt
