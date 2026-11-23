@@ -316,3 +316,10 @@ a.button:hover { text-decoration: none; filter: brightness(0.97); }
   .hero-cover { aspect-ratio: 16 / 7; min-height: 0; }
   .hero-body { padding: 16px; }
 }
+
+/* ---------- Project edit / delete ---------- */
+.row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.danger-zone { border-color: var(--danger); }
+.danger-zone p { margin: 0; }
+button.danger-solid { background: var(--danger); border-color: var(--danger); color: #fff; }
+button.danger-solid:disabled { opacity: 0.45; }

@@ -8,6 +8,8 @@ findings are listed most-severe first, and signed-in users can assign them, move
 opengrep scan ──► AI triage (scripts/triage-opengrep.js) ──► POST /api/ingest ──► SecPatchlog ──► team
 ```
 
+To connect a repository, follow **[SETUP-README.md](SETUP-README.md)**.
+
 - Backend: Node ≥ 22.13 + Express 5. Storage: SQLite through Node's built-in `node:sqlite`, so there's no DB server.
 - Frontend: plain HTML/JS in `public/`, served by the same server.
 
@@ -35,6 +37,10 @@ in `.env` so the admin is created on first start. After that:
   - Formats: PNG, JPEG, WebP or GIF, up to 5 MB. SVG is refused because it can carry script.
   - The file's contents are checked against its type.
   - Covers are stored in the SQLite DB (`project_covers` table) and need a signed-in user to view.
+- Under **Manage projects**, admins can **Edit** a project (its name and description; the API key stays the same) or **Delete** it.
+  - Deleting is permanent. It removes the project with all its scans, findings, comments, activity and cover, and its API key stops working.
+  - You must type the project name to confirm. The API checks it too: `DELETE /api/projects/:id` with body `{"confirmName": "<exact name>"}`.
+  - Each delete is logged to the server console.
 
 | Env var          | Default            | Notes                                                    |
 | ---------------- | ------------------ | -------------------------------------------------------- |
@@ -143,42 +149,18 @@ curl -X POST http://localhost:4400/api/ingest \
 
 (`opengrep-triage.json` written by the triage script is already in this format. The extra `meta` key is ignored.)
 
-## GitHub Action (example, not enabled)
+## Connecting a repo (GitHub Actions)
 
-This assumes opengrep rules are available in the runner, and an AI key for opencode
-(e.g. `ANTHROPIC_API_KEY`) is stored as a repo secret:
+**See [SETUP-README.md](SETUP-README.md)** for the full, tested setup: creating the project, copying the
+workflow and script from [`templates/`](templates/), preparing the runner, adding the secrets and variables, the
+first run and troubleshooting.
 
-```yaml
-name: security-scan
-on:
-  push: { branches: [main] }
-  workflow_dispatch:
-jobs:
-  scan:
-    runs-on: ubuntu-latest
-    steps:
-      # Ask SecPatchlog first; everything below is skipped if the project was scanned recently
-      - id: gate
-        run: |
-          echo "scan=$(curl -sf "${{ secrets.TRIAGE_GATE_URL }}" \
-            -H "Authorization: Bearer ${{ secrets.TRIAGE_REPORT_TOKEN }}" || echo 1)" >> "$GITHUB_OUTPUT"
-      - if: steps.gate.outputs.scan == '1'
-        uses: actions/checkout@v4
-      - if: steps.gate.outputs.scan == '1'
-        uses: actions/setup-node@v4
-        with: { node-version: 24 }
-      - if: steps.gate.outputs.scan == '1'
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/main/install.sh | bash
-          git clone --depth 1 https://github.com/opengrep/opengrep-rules ~/opengrep-rules
-          npm i -g opencode-ai
-      - if: steps.gate.outputs.scan == '1'
-        run: node scripts/triage-opengrep.js --engine opencode --force   # gate already checked
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          TRIAGE_REPORT_URL: ${{ secrets.TRIAGE_REPORT_URL }}
-          TRIAGE_REPORT_TOKEN: ${{ secrets.TRIAGE_REPORT_TOKEN }}
-```
+In short, each repo gets:
+
+- `.github/workflows/security-scan.yml`: after a successful deploy, a gate job asks `/api/should-scan`. If a scan
+  is due, a job in a `node:24` container checks out the deployed commit, runs opengrep, has Claude Code (or opencode)
+  triage the results read-only, and posts them to `/api/ingest`.
+- `scripts/triage-opengrep.js`: the scan + triage + send script, also usable locally (`npm run triage`).
 
 ## Roles
 
@@ -186,7 +168,7 @@ jobs:
 | --------------------------------------------------------- | :----: | :---: |
 | View findings, scans and projects                         |   ✓    |   ✓   |
 | Assign, change status or severity, comment                |   ✓    |   ✓   |
-| Create projects, rotate API keys, set cover images        |        |   ✓   |
+| Create, edit and delete projects, rotate keys, set covers |        |   ✓   |
 | Add users, change roles, disable users, reset passwords   |        |   ✓   |
 
 ## Security notes

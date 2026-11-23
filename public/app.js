@@ -982,6 +982,97 @@ async function renderProjects() {
       )
     : null;
   keyArea.id = 'key-area';
+  const panel = h('div'); // edit / delete panel for one project
+
+  function closePanel() {
+    panel.replaceChildren();
+  }
+  function showPanel(node) {
+    keyArea.replaceChildren();
+    panel.replaceChildren(node);
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    const first = panel.querySelector('input');
+    if (first) first.focus();
+  }
+
+  function editPanel(p) {
+    const err = h('div', { class: 'error-text' });
+    const form = h(
+      'form',
+      {
+        class: 'card stack',
+        onsubmit: async (e) => {
+          e.preventDefault();
+          const fd = Object.fromEntries(new FormData(form));
+          try {
+            await api('PATCH', `/projects/${p.id}`, { name: fd.name, description: fd.description });
+            toast('Project updated');
+            await renderProjects();
+          } catch (ex) {
+            err.textContent = ex.message;
+          }
+        },
+      },
+      h('h2', {}, `Edit ${p.name}`),
+      h(
+        'div',
+        { class: 'form-row' },
+        h('label', { class: 'field' }, 'Name', h('input', { name: 'name', required: true, maxlength: 100, value: p.name })),
+        h('label', { class: 'field' }, 'Description', h('input', { name: 'description', maxlength: 500, value: p.description || '' }))
+      ),
+      h('p', { class: 'muted small' }, 'Renaming doesn’t change the API key, so the pipeline keeps working.'),
+      err,
+      h(
+        'div',
+        { class: 'form-row' },
+        h('button', { class: 'primary', type: 'submit' }, 'Save changes'),
+        h('button', { type: 'button', onclick: closePanel }, 'Cancel')
+      )
+    );
+    return form;
+  }
+
+  function deletePanel(p) {
+    const err = h('div', { class: 'error-text' });
+    const confirmInput = h('input', {
+      name: 'confirmName',
+      autocomplete: 'off',
+      'aria-label': `Type ${p.name} to confirm`,
+      oninput: () => (deleteBtn.disabled = confirmInput.value !== p.name),
+    });
+    const deleteBtn = h('button', { class: 'danger-solid', type: 'submit', disabled: true }, 'Delete project permanently');
+    const form = h(
+      'form',
+      {
+        class: 'card stack danger-zone',
+        onsubmit: async (e) => {
+          e.preventDefault();
+          if (confirmInput.value !== p.name) return;
+          deleteBtn.disabled = true;
+          try {
+            const r = await api('DELETE', `/projects/${p.id}`, { confirmName: confirmInput.value });
+            toast(`Deleted ${r.deleted.name} (${r.deleted.findings} findings, ${r.deleted.scans} scans)`);
+            await renderProjects();
+          } catch (ex) {
+            err.textContent = ex.message;
+            deleteBtn.disabled = false;
+          }
+        },
+      },
+      h('h2', {}, `Delete ${p.name}?`),
+      h(
+        'p',
+        {},
+        'This permanently deletes the project with all its scans, findings, comments, activity history and cover image. ',
+        h('strong', {}, 'It cannot be undone.'),
+        ' Its API key stops working immediately, so the pipeline can no longer send results for it.'
+      ),
+      h('label', { class: 'field' }, h('span', {}, 'Type ', h('strong', { class: 'mono' }, p.name), ' to confirm'), confirmInput),
+      err,
+      h('div', { class: 'form-row' }, deleteBtn, h('button', { type: 'button', onclick: closePanel }, 'Cancel'))
+    );
+    return form;
+  }
 
   const rows = state.projects.map((p) => {
     let confirming = false;
@@ -1017,7 +1108,19 @@ async function renderProjects() {
       h('td', { class: 'muted' }, fmtDate(p.lastScanAt)),
       h('td', {}, isAdmin ? intervalInput(p) : `${p.effectiveScanIntervalDays} days`),
       h('td', { class: 'mono' }, `${p.keyPrefix}…`),
-      isAdmin ? h('td', {}, rotateBtn) : null
+      isAdmin
+        ? h(
+            'td',
+            {},
+            h(
+              'div',
+              { class: 'row-actions' },
+              h('button', { type: 'button', onclick: () => showPanel(editPanel(p)) }, 'Edit'),
+              rotateBtn,
+              h('button', { type: 'button', class: 'danger', onclick: () => showPanel(deletePanel(p)) }, 'Delete')
+            )
+          )
+        : null
     );
   });
 
@@ -1030,6 +1133,7 @@ async function renderProjects() {
         'div',
         { class: 'stack' },
         keyArea,
+        panel,
         createForm,
         h(
           'div',
